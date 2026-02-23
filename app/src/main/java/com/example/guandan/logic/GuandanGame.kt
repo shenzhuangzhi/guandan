@@ -418,6 +418,9 @@ class GuandanGame {
     /**
      * 【修改】判断三带二（逢人配不能当王）
      */
+    /**
+     * 【修改】判断三带二（逢人配不能当王）
+     */
     private fun isThreeWithTwoWithFengRenPei(normalCards: List<Card>, fengRenPeiCount: Int): Boolean {
         if (normalCards.size + fengRenPeiCount != 5) return false
 
