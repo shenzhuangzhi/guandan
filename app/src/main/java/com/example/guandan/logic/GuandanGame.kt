@@ -159,7 +159,7 @@ class GuandanGame {
     }
 
     /**
-     * 重置游戏状态（用于重新开牌）
+     * 【修改】重置游戏状态（用于重新开牌）- 确保完全重置
      */
     fun resetGameState() {
         lastPlayedCards = emptyList()
@@ -167,6 +167,8 @@ class GuandanGame {
         lastPlayerName = ""
         passCount = 0
         aiCurrentPlayedCards = emptyList()
+        hasUpgradedThisRound = false
+        android.util.Log.d("GameReset", "游戏状态已重置")
     }
 
     /**
@@ -718,16 +720,58 @@ class GuandanGame {
         return getThreeWithTwoValueWithFengRenPei(current) > getThreeWithTwoValueWithFengRenPei(last)
     }
 
+    /**
+     * 【修改】正确获取三带二的比较值（三张部分的值）
+     */
     private fun getThreeWithTwoValueWithFengRenPei(cards: List<Card>): Int {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         val validNormalCards = normalCards.filter { !it.rank.isJoker() }
+        val fengRenPeiCount = fengRenPeiList.size
         val rankGroups = validNormalCards.groupBy { it.rank }
 
-        // 找三张的部分
-        val threePart = rankGroups.entries.find { it.value.size + fengRenPeiList.size >= 3 }
-            ?: rankGroups.entries.maxByOrNull { it.value.size }
+        // 【关键】正确识别三带二的结构：3张相同点数 + 2张相同点数（且不同）
+        // 遍历所有可能的组合，找到真正的"三张"部分
 
-        return threePart?.let { getEffectiveValue(it.key) } ?: getEffectiveValue(fixedLevelRank)
+        // 情况1：普通牌中就有3张相同的（无配或配当其他用）
+        val normalTriple = rankGroups.entries.find { it.value.size == 3 }
+        if (normalTriple != null) {
+            return getEffectiveValue(normalTriple.key)
+        }
+
+        // 情况2：普通牌中有2张相同 + 1张配 = 三张
+        // 同时普通牌中另有2张相同 = 对子
+        val pairs = rankGroups.filter { it.value.size == 2 }
+        if (pairs.size >= 2 && fengRenPeiCount >= 1) {
+            // 有两个对子，用配凑成三张，剩下一个对子
+            // 三张是：配 + 其中一个对子（选较大的那个当三张）
+            val pairEntries = pairs.entries.sortedByDescending { getEffectiveValue(it.key) }
+            // 较大的对子 + 配 = 三张
+            return getEffectiveValue(pairEntries[0].key)
+        }
+
+        // 情况3：普通牌中1张 + 2张配 = 三张，另有2张 = 对子
+        if (fengRenPeiCount >= 2) {
+            val pair = rankGroups.entries.find { it.value.size == 2 }
+            if (pair != null) {
+                // 对子就是"对子"部分，其他（配+单牌）组成三张
+                // 三张的点数是单牌的点数
+                val singleForThree = rankGroups.entries.find { it.value.size == 1 }
+                if (singleForThree != null) {
+                    return getEffectiveValue(singleForThree.key)
+                }
+            }
+        }
+
+        // 情况4：普通牌中2张相同 + 配 = 三张，另有2张单牌 + 配 = 对子（不可能，因为只有1张配）
+        // 情况5：普通牌中有2张相同（对子），另有3张配（当三张）- 但配不能当王，可以当任何普通牌
+        if (fengRenPeiCount >= 3) {
+            // 3张配当三张， value按级牌算
+            return getEffectiveValue(fixedLevelRank)
+        }
+
+        // 默认：找数量最多的作为三张（兜底）
+        val maxGroup = rankGroups.maxByOrNull { it.value.size }
+        return maxGroup?.let { getEffectiveValue(it.key) } ?: getEffectiveValue(fixedLevelRank)
     }
 
     /**
@@ -773,7 +817,7 @@ class GuandanGame {
     }
 
     /**
-     * 【核心修改】AI自动出牌 - 增加逢人配支持（不能当王）
+     * 【修改】AI自动出牌 - 修复大牌后过牌问题、队友互压问题、新局不出牌问题
      */
     fun autoPlayOneCard(aiPlayer: Player): Card? {
         if (!this::gameRoom.isInitialized || !aiPlayer.isCurrentTurn || aiPlayer.cards.isEmpty()) {
@@ -790,31 +834,64 @@ class GuandanGame {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         val hasFengRenPei = fengRenPeiList.isNotEmpty()
 
-        // 【新增】检查是否有敌方剩余1-2张牌
+        // 检查是否有敌方剩余1-2张牌
         val enemyAlmostWin = gameRoom.players.any {
             it.team != aiPlayer.team && (it.cards.size == 1 || it.cards.size == 2)
         }
 
-        // 【新增】获取敌方剩余牌数（用于判断危险程度）
+        // 获取敌方剩余牌数
         val minEnemyCards = gameRoom.players
             .filter { it.team != aiPlayer.team }
             .minOfOrNull { it.cards.size } ?: 27
 
-        if (lastPlayedCards.isNotEmpty()) {
+        // 【关键修复】判断是应该出新牌还是压牌
+        val shouldPlayNewCards = if (lastPlayedCards.isEmpty()) {
+            // 没有上家出的牌，肯定是新牌
+            true
+        } else {
+            // 检查上家是否是自己（自己是大牌玩家）
+            val lastPlayer = gameRoom.players.find { it.id == lastPlayerId }
+
+            if (lastPlayer?.id == aiPlayer.id) {
+                // 【关键】自己是大牌玩家，应该出新牌
+                android.util.Log.d("AI_PLAY", "${aiPlayer.name} 自己是大牌玩家，出新牌")
+                true
+            } else {
+                // 检查是否其他人都过牌了（一圈过完）
+                val isNewRound = passCount >= gameRoom.players.size - 1
+                if (isNewRound) {
+                    android.util.Log.d("AI_PLAY", "${aiPlayer.name} 其他人全过牌，出新牌")
+                    true
+                } else {
+                    // 需要压牌
+                    false
+                }
+            }
+        }
+
+        if (!shouldPlayNewCards && lastPlayedCards.isNotEmpty()) {
+            // ===== 需要压牌的情况 =====
             val lastType = getCardTypeWithFengRenPei(lastPlayedCards) ?: return null
 
             val lastPlayer = gameRoom.players.find { it.id == lastPlayerId }
 
-            val isTeammate = lastPlayer != null && lastPlayer.team == aiPlayer.team && lastPlayer.id != aiPlayer.id
+            // 【修改】队友判断：lastPlayer存在、是队友、不是自己
+            val isTeammate = lastPlayer != null &&
+                    lastPlayer.team == aiPlayer.team &&
+                    lastPlayer.id != aiPlayer.id
 
-            if (isTeammate && isTeammateBigPlay(lastPlayedCards, lastType)) {
+            // 【关键修复】只要是队友出的牌，就过牌（不压队友）
+            if (isTeammate) {
+                android.util.Log.d("AI_PLAY", "${aiPlayer.name} 队友出牌，过牌")
                 passTurn(aiPlayer.id)
                 return null
             }
 
+            // 根据敌方危险程度选择压牌策略
             playedCards = when (lastType) {
                 CardType.SINGLE -> {
                     if (enemyAlmostWin) {
+                        // 敌方快赢，出最大牌压
                         val alternative = findAnyPairWithFengRenPei(cards).takeIf { it.isNotEmpty() }
                             ?: findAnyTripleWithFengRenPei(cards).takeIf { it.isNotEmpty() }
                             ?: findAnyBombWithFengRenPei(cards).takeIf { it.isNotEmpty() }
@@ -830,6 +907,7 @@ class GuandanGame {
                             findMaxSingleToBeatWithFengRenPei(cards, lastPlayedCards[0])
                         }
                     } else {
+                        // 正常情况，出最小能压的牌
                         findMinSingleToBeatWithFengRenPei(cards, lastPlayedCards[0])
                     }
                 }
@@ -854,13 +932,9 @@ class GuandanGame {
                 }
                 CardType.TRIPLE -> findMinTripleToBeatWithFengRenPei(cards, lastPlayedCards[0].rank)
                 CardType.BOMB -> {
-                    if (isTeammate) emptyList() else findMinBombToBeatWithFengRenPei(
-                        cards,
-                        lastPlayedCards[0].rank,
-                        lastPlayedCards.size
-                    )
+                    // 敌方出炸弹，找更大炸弹
+                    findMinBombToBeatWithFengRenPei(cards, lastPlayedCards[0].rank, lastPlayedCards.size)
                 }
-
                 CardType.THREE_WITH_TWO -> findMinThreeWithTwoToBeatWithFengRenPei(cards, lastPlayedCards)
                 CardType.STRAIGHT -> findMinStraightToBeatWithFengRenPei(cards, lastPlayedCards)
                 CardType.PLANK -> findMinPlankToBeatWithFengRenPei(cards, lastPlayedCards)
@@ -868,12 +942,18 @@ class GuandanGame {
                 else -> emptyList()
             }
 
-            if (playedCards.isEmpty() && !isTeammate) {
-                playedCards = findAnyBombWithFengRenPei(cards)
+            // 找不到对应牌型压牌，尝试用炸弹
+            if (playedCards.isEmpty()) {
+                if (enemyAlmostWin) {
+                    // 敌方快赢，必须用炸弹
+                    playedCards = findAnyBombWithFengRenPei(cards)
+                }
+                // 否则过牌（不浪费炸弹）
             }
         } else {
-            // 首轮出牌策略：优先出复杂牌型
+            // ===== 出新牌的情况（自己大牌后或新局开始）=====
             playedCards = when {
+                // 敌方快赢，出最大牌型
                 minEnemyCards <= 2 -> {
                     when {
                         findAnySteelPlateWithFengRenPei(cards).isNotEmpty() -> findAnySteelPlateWithFengRenPei(cards)
@@ -885,6 +965,7 @@ class GuandanGame {
                         else -> findMaxSingleWithFengRenPei(cards)
                     }
                 }
+                // 正常情况，优先出复杂牌型（从小到大）
                 findAnySteelPlateWithFengRenPei(cards).isNotEmpty() -> findAnySteelPlateWithFengRenPei(cards)
                 findAnyPlankWithFengRenPei(cards).isNotEmpty() -> findAnyPlankWithFengRenPei(cards)
                 findAnyStraightWithFengRenPei(cards).isNotEmpty() -> findAnyStraightWithFengRenPei(cards)
@@ -895,15 +976,30 @@ class GuandanGame {
             }
         }
 
+        // 执行出牌
         return if (playedCards.isNotEmpty()) {
             val success = playCards(aiPlayer.id, playedCards)
             if (success) {
                 playedCards[0]
             } else {
+                // 出牌失败，尝试出单张保底
+                if (shouldPlayNewCards && playedCards.size > 1) {
+                    val fallback = findMinSingleWithFengRenPei(cards)
+                    if (fallback.isNotEmpty()) {
+                        val fallbackSuccess = playCards(aiPlayer.id, fallback)
+                        if (fallbackSuccess) {
+                            android.util.Log.d("AI_PLAY", "${aiPlayer.name} 原牌型失败，改出单张")
+                            return fallback[0]
+                        }
+                    }
+                }
+                android.util.Log.w("AI_PLAY", "${aiPlayer.name} 出牌失败，过牌")
                 passTurn(aiPlayer.id)
                 null
             }
         } else {
+            // 没找到牌，过牌
+            android.util.Log.d("AI_PLAY", "${aiPlayer.name} 无牌可出，过牌")
             passTurn(aiPlayer.id)
             null
         }
@@ -1688,23 +1784,16 @@ class GuandanGame {
     fun passTurn(playerId: String) {
         if (!this::gameRoom.isInitialized) return
 
-        val currentPlayer = gameRoom.players.find { it.isCurrentTurn }
-
-        if (currentPlayer?.id != playerId) {
-            android.util.Log.w("GuandanGame", "passTurn: 玩家$playerId 不是当前玩家 ${currentPlayer?.id}，但继续执行")
-            val requestingPlayer = gameRoom.players.find { it.id == playerId }
-            if (requestingPlayer == null) {
-                android.util.Log.e("GuandanGame", "passTurn: 找不到玩家$playerId")
-                return
-            }
-            if (!requestingPlayer.isCurrentTurn) {
-                android.util.Log.d("GuandanGame", "passTurn: 玩家${requestingPlayer.name}标记不是当前回合，但强制过牌")
-            }
+        val player = gameRoom.players.find { it.id == playerId }
+        if (player == null) {
+            android.util.Log.e("GuandanGame", "passTurn: 找不到玩家$playerId")
+            return
         }
 
         passCount++
-        android.util.Log.d("GuandanGame", "玩家${currentPlayer?.name ?: playerId} 过牌，passCount=$passCount")
+        android.util.Log.d("GuandanGame", "玩家${player.name} 过牌，passCount=$passCount")
 
+        // 【关键】一圈过牌后重置（其他人都过牌了）
         if (passCount >= gameRoom.players.size - 1) {
             lastPlayedCards = emptyList()
             lastPlayerId = ""
