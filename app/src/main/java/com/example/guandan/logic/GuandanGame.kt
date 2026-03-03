@@ -8,6 +8,7 @@ import com.example.guandan.model.GameRoom
 import com.example.guandan.model.Player
 import com.example.guandan.utils.CardComparator
 import java.util.UUID
+import kotlin.random.Random
 
 class GuandanGame {
     lateinit var gameRoom: GameRoom
@@ -40,6 +41,10 @@ class GuandanGame {
 
     // 当前级牌点数（整局固定，不随出牌玩家变化）
     val currentLevelRank: CardRank get() = fixedLevelRank
+
+    // 【新增】标记最后一手牌是否是接风（队友接风）
+    private var isJieFeng: Boolean = false
+    private var jieFengPlayerId: String = ""
 
 
     enum class CardType {
@@ -102,7 +107,7 @@ class GuandanGame {
     }
 
     /**
-     * 【新增】获取牌的有效比较值（与CardComparator一致）
+     * 【修改】获取牌的有效比较值（与CardComparator一致）
      * - 2（非级牌）：2（最小）
      * - 3-A：3-14
      * - 级牌：15（比A大，比小王小）
@@ -132,6 +137,13 @@ class GuandanGame {
         val fengRenPeiList = cards.filter { isFengRenPei(it) }
         val normalCards = cards.filter { !isFengRenPei(it) }
         return Pair(fengRenPeiList, normalCards)
+    }
+
+    /**
+     * 【新增】判断是否是四王炸（2小王+2大王，或4小王，或4大王）
+     */
+    private fun isFourJokers(cards: List<Card>): Boolean {
+        return cards.size == 4 && cards.all { it.rank.isJoker() }
     }
 
     /**
@@ -167,12 +179,14 @@ class GuandanGame {
         lastPlayerName = ""
         passCount = 0
         aiCurrentPlayedCards = emptyList()
+        isJieFeng = false
+        jieFengPlayerId = ""
     }
 
     /**
-     * 初始化游戏 - 使用位置索引确定谁先出牌
+     * 【修改】初始化游戏 - 首局随机，后续使用位置索引
      */
-    fun initGame(gameMode: GameMode, firstPlayerPosition: Int = 0): GameRoom {
+    fun initGame(gameMode: GameMode, firstPlayerPosition: Int = -1): GameRoom {
         val roomId = UUID.randomUUID().toString().substring(0, 8)
         val room = GameRoom(
             roomId = roomId,
@@ -186,8 +200,13 @@ class GuandanGame {
         // 先赋值 gameRoom
         this.gameRoom = room
 
-        // 使用位置索引确定谁先出牌（0=玩家, 1=AI1, 2=AI2, 3=AI3）
-        val startPosition = firstPlayerPosition.coerceIn(0, room.players.size - 1)
+        // 【修改】首局随机决定先出牌，后续按头游位置
+        val startPosition = if (firstPlayerPosition == -1) {
+            Random.nextInt(room.players.size)  // 首局随机
+        } else {
+            firstPlayerPosition.coerceIn(0, room.players.size - 1)
+        }
+
         val startPlayer = room.players.getOrNull(startPosition)
 
         if (startPlayer != null) {
@@ -310,8 +329,39 @@ class GuandanGame {
         lastPlayerName = currentPlayer.name
         passCount = 0
 
+        // 【新增】检查是否出完牌（接风逻辑）
+        if (currentPlayer.cards.isEmpty()) {
+            handlePlayerOut(currentPlayer)
+            // 接风：如果成为头游且无人压牌，队友接风
+            val teammate = getTeammate(currentPlayer)
+            if (teammate != null) {
+                isJieFeng = true
+                jieFengPlayerId = teammate.id
+                // 直接设置队友为当前回合
+                gameRoom.currentPlayerId = teammate.id
+                gameRoom.players.forEach { it.isCurrentTurn = false }
+                teammate.isCurrentTurn = true
+                return true
+            }
+        }
+
         switchToNextPlayer()
         return true
+    }
+
+    /**
+     * 【新增】获取队友
+     */
+    private fun getTeammate(player: Player): Player? {
+        return gameRoom.players.find { it.team == player.team && it.id != player.id }
+    }
+
+    /**
+     * 【新增】处理玩家出完牌（头游/二游/三游/末游标记）
+     */
+    private fun handlePlayerOut(player: Player) {
+        // 标记为已出完，后续在getWinner中计算排名
+        println("${player.name} 已出完牌！")
     }
 
     /**
@@ -321,9 +371,12 @@ class GuandanGame {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         val fengRenPeiCount = fengRenPeiList.size
 
-        // 全是逢人配：只能当单张出（不能组成对子/炸弹等，因为不能当王）
+        // 【修改】全是逢人配：1张单张，多张不能组成炸弹（因为不能当王）
         if (normalCards.isEmpty()) {
-            return if (fengRenPeiCount == 1) CardType.SINGLE else null
+            return when (fengRenPeiCount) {
+                1 -> CardType.SINGLE
+                else -> null  // 多张配不能组成炸弹（不能当王）
+            }
         }
 
         // 没有逢人配：用原来的判断
@@ -344,6 +397,7 @@ class GuandanGame {
                     CardType.PAIR
                 } else null
             }
+
             3 -> {
                 // 三张：2配+1牌 或 1配+2张相同牌（都不能是王）
                 if (fengRenPeiCount == 2 && normalCards.size == 1 && !normalCards[0].rank.isJoker()) CardType.TRIPLE
@@ -351,28 +405,37 @@ class GuandanGame {
                 else if (isAllSameRankNormal(normalCards)) CardType.TRIPLE
                 else null
             }
+
             4 -> {
+                // 【关键修复】先检查四王炸
+                if (isFourJokers(cards)) {
+                    return CardType.BOMB
+                }
                 // 炸弹：3配+1牌 或 2配+2张相同 或 1配+3张相同（都不能是王）
-                // 【关键】4张配不能当炸弹（因为不能当王凑成4张王炸）
                 if (fengRenPeiCount == 3 && normalCards.size == 1 && !normalCards[0].rank.isJoker()) CardType.BOMB
                 else if (fengRenPeiCount == 2 && isAllSameRankNormal(normalCards) && !normalCards[0].rank.isJoker()) CardType.BOMB
                 else if (fengRenPeiCount == 1 && isAllSameRankNormal(normalCards) && !normalCards[0].rank.isJoker()) CardType.BOMB
                 else if (isAllSameRankNormal(normalCards)) CardType.BOMB
                 else null
             }
+
             5 -> {
                 when {
                     // 三带二判断（都不能是王）
-                    isThreeWithTwoWithFengRenPei(normalCards, fengRenPeiCount) -> CardType.THREE_WITH_TWO
+                    isThreeWithTwoWithFengRenPei(
+                        normalCards,
+                        fengRenPeiCount
+                    ) -> CardType.THREE_WITH_TWO
                     // 同花顺判断（不能有配当王）
                     fengRenPeiCount == 0 && isStraightFlush(cards) -> CardType.STRAIGHT_FLUSH
-                    // 顺子判断（配可以填补，但不能当2或王）
+                    // 顺子判断（配可以填补，但不能当王）
                     isStraightWithFengRenPei(normalCards, fengRenPeiCount) -> CardType.STRAIGHT
                     // 炸弹（4+1配，不能是王）
                     fengRenPeiCount == 1 && isAllSameRankNormal(normalCards) && !normalCards[0].rank.isJoker() -> CardType.BOMB
                     else -> null
                 }
             }
+
             6 -> {
                 when {
                     // 木板判断（简化：有配时不判断木板）
@@ -384,19 +447,24 @@ class GuandanGame {
                     else -> null
                 }
             }
-            in 7..8 -> {
+            // 【修改】支持7-10张炸弹
+            in 7..10 -> {
                 // 大炸弹（不能是王）
                 if (isBombWithFengRenPeiNoJoker(normalCards, fengRenPeiCount)) CardType.BOMB
                 else null
             }
+
             else -> null
         }
     }
 
     /**
-     * 【新增】判断炸弹（逢人配不能当王）
+     * 【修改】判断炸弹（逢人配不能当王）- 支持最多10张
      */
-    private fun isBombWithFengRenPeiNoJoker(normalCards: List<Card>, fengRenPeiCount: Int): Boolean {
+    private fun isBombWithFengRenPeiNoJoker(
+        normalCards: List<Card>,
+        fengRenPeiCount: Int
+    ): Boolean {
         // 普通牌中有王，不能用配凑炸弹（因为配不能当王）
         if (normalCards.any { it.rank.isJoker() }) {
             // 王只能和配组成王炸，但王炸需要4张王，配不能当王
@@ -410,15 +478,18 @@ class GuandanGame {
         val firstRank = normalCards[0].rank
         if (!normalCards.all { it.rank == firstRank }) return false
 
-        // 普通牌数量 + 配数量 >= 4 且 <= 8
+        // 【修改】普通牌数量 + 配数量 >= 4 且 <= 10（支持10张炸弹）
         val totalCount = normalCards.size + fengRenPeiCount
-        return totalCount in 4..8
+        return totalCount in 4..10
     }
 
     /**
      * 【修改】判断三带二（逢人配不能当王）
      */
-    private fun isThreeWithTwoWithFengRenPei(normalCards: List<Card>, fengRenPeiCount: Int): Boolean {
+    private fun isThreeWithTwoWithFengRenPei(
+        normalCards: List<Card>,
+        fengRenPeiCount: Int
+    ): Boolean {
         if (normalCards.size + fengRenPeiCount != 5) return false
 
         // 不能有王参与（配不能当王）
@@ -432,42 +503,68 @@ class GuandanGame {
         }
 
         // 情况2: 有配的情况
-        // 2配 + 3张相同 = 三带二
+        // 2配 + 3张相同 = 三带二（2张配可以当对子，因为都是级牌）
         if (fengRenPeiCount == 2 && rankGroups.size == 1 && rankGroups.values.first().size == 3) return true
 
-        // 1配 + 2张相同 + 2张相同 = 三带二（配凑成3张）
+        // 1配 + 2张相同 + 2张相同 = 三带二（配凑成3张的一部分）
         if (fengRenPeiCount == 1 && rankGroups.size == 2 && rankGroups.values.all { it.size == 2 }) return true
 
         return false
     }
 
     /**
-     * 【修改】判断顺子（逢人配不能当2或王）
+     * 【关键修改】判断顺子（逢人配可以当2，但普通2不能参与顺子）
+     *
+     * 标准规则：
+     * - 顺子只能是5张
+     * - 普通2和王不能出现在顺子中
+     * - 逢人配可以当任意牌（包括2），所以可以用配来组成含2的顺子如A-2-3-4-5
      */
     private fun isStraightWithFengRenPei(normalCards: List<Card>, fengRenPeiCount: Int): Boolean {
         if (normalCards.size + fengRenPeiCount != 5) return false
 
-        // 顺子不能包含2和王（即使是普通牌）
-        if (normalCards.any { it.rank == CardRank.TWO || it.rank.isJoker() }) return false
+        // 【修改】普通牌中不能有王，普通2也不能参与顺子
+        // 过滤出普通牌中的非王、非2牌（这些是必须有的）
+        val validNormalCards = normalCards.filter { !it.rank.isJoker() && it.rank != CardRank.TWO }
+        val normalTwos = normalCards.filter { it.rank == CardRank.TWO }  // 普通2
 
-        val uniqueRanks = normalCards.map { it.rank.value }.distinct().sorted()
+        // 普通2不能参与顺子，必须用配来当2
+        val neededFengRenPeiForTwos = normalTwos.size
 
-        // 检查是否有重复（除了可以用配填补的）
-        if (uniqueRanks.size != normalCards.size) return false
+        // 剩余的配用于填补顺子空缺
+        val remainingFengRenPei = fengRenPeiCount - neededFengRenPeiForTwos
 
-        if (uniqueRanks.isEmpty()) return false // 不能全是配
+        if (remainingFengRenPei < 0) return false  // 配不够替代普通2
+
+        val uniqueRanks = validNormalCards.map { it.rank.value }.distinct().sorted()
+
+        // 检查是否有重复
+        if (uniqueRanks.size != validNormalCards.size) return false
+
+        if (uniqueRanks.isEmpty()) {
+            // 全是配（或配+普通2），无法确定顺子起点
+            return false
+        }
 
         val minRank = uniqueRanks.first()
         val maxRank = uniqueRanks.last()
+
+        // 特殊处理A-2-3-4-5：A=14, 2=2, 3=3, 4=4, 5=5
+        if (uniqueRanks.contains(14) && uniqueRanks.contains(3) &&
+            uniqueRanks.contains(4) && uniqueRanks.contains(5)
+        ) {
+            // 检查是否缺2
+            if (!uniqueRanks.contains(2) && remainingFengRenPei >= 1) {
+                return true
+            }
+        }
+
+        // 正常顺子：5张连续
         val range = maxRank - minRank + 1
+        val neededInRange = range - uniqueRanks.size
+        val totalNeeded = neededInRange + (5 - range)
 
-        // 需要的配数量 = 总范围 - 已有牌数
-        val neededFengRenPei = range - uniqueRanks.size
-
-        // 还需要填补两端的空缺
-        val totalNeeded = neededFengRenPei + (5 - range)
-
-        return fengRenPeiCount >= totalNeeded && fengRenPeiCount <= 4 // 最多4张配（至少1张普通牌）
+        return remainingFengRenPei >= totalNeeded && remainingFengRenPei <= 4
     }
 
     /**
@@ -478,7 +575,12 @@ class GuandanGame {
             1 -> CardType.SINGLE
             2 -> if (isAllSameRankNormal(cards)) CardType.PAIR else null
             3 -> if (isAllSameRankNormal(cards)) CardType.TRIPLE else null
-            4 -> if (isAllSameRankNormal(cards)) CardType.BOMB else null
+            4 -> {
+                // 【关键修复】先检查四王炸
+                if (isFourJokers(cards)) return CardType.BOMB
+                if (isAllSameRankNormal(cards)) CardType.BOMB else null
+            }
+
             5 -> {
                 when {
                     isThreeWithTwoNormal(cards) -> CardType.THREE_WITH_TWO
@@ -488,6 +590,7 @@ class GuandanGame {
                     else -> null
                 }
             }
+
             6 -> {
                 when {
                     isPlank(cards) -> CardType.PLANK
@@ -496,9 +599,11 @@ class GuandanGame {
                     else -> null
                 }
             }
-            in 7..8 -> {
+            // 【修改】支持7-10张炸弹
+            in 7..10 -> {
                 if (isAllSameRankNormal(cards)) CardType.BOMB else null
             }
+
             else -> null
         }
     }
@@ -515,9 +620,12 @@ class GuandanGame {
         return rankGroups.size == 2 && rankGroups.values.any { it.size == 3 } && rankGroups.values.any { it.size == 2 }
     }
 
+    /**
+     * 【修改】顺子判断：普通2和王不能参与
+     */
     private fun isStraight(cards: List<Card>): Boolean {
         if (cards.size != 5) return false
-        // 【修改】顺子不能包含2和王
+        // 顺子不能包含2和王（即使是普通牌）
         if (cards.any { it.rank == CardRank.TWO || it.rank.isJoker() }) return false
         val sortedValues = cards.map { it.rank.value }.sorted()
         for (i in 1 until sortedValues.size) {
@@ -539,7 +647,7 @@ class GuandanGame {
 
     private fun isPlank(cards: List<Card>): Boolean {
         if (cards.size != 6) return false
-        // 【修改】木板不能包含2和王
+        // 木板不能包含2和王
         if (cards.any { it.rank == CardRank.TWO || it.rank.isJoker() }) return false
         val rankGroups = cards.groupBy { it.rank }.toList().sortedBy { it.first.value }
         if (rankGroups.size != 3) return false
@@ -552,7 +660,7 @@ class GuandanGame {
 
     private fun isSteelPlate(cards: List<Card>): Boolean {
         if (cards.size != 6) return false
-        // 【修改】钢板不能包含2和王
+        // 钢板不能包含2和王
         if (cards.any { it.rank == CardRank.TWO || it.rank.isJoker() }) return false
         val rankGroups = cards.groupBy { it.rank }.toList().sortedBy { it.first.value }
         if (rankGroups.size != 2) return false
@@ -606,11 +714,13 @@ class GuandanGame {
                 val lastMax = getMaxEffectiveValueWithFengRenPei(lastPlayedCards)
                 currentMax > lastMax
             }
+
             CardType.PLANK -> {
                 val currentMax = getMaxEffectiveValueWithFengRenPei(cards)
                 val lastMax = getMaxEffectiveValueWithFengRenPei(lastPlayedCards)
                 currentMax > lastMax
             }
+
             CardType.STEEL_PLATE -> compareSteelPlateWithFengRenPei(cards, lastPlayedCards)
         }
     }
@@ -690,14 +800,31 @@ class GuandanGame {
     }
 
     /**
-     * 【新增】炸弹比较（支持逢人配，不能当王）
+     * 【关键修复】炸弹比较（支持逢人配，不能当王，王炸最大）
      */
     private fun compareBombWithFengRenPei(current: List<Card>, last: List<Card>): Boolean {
+        // 【新增】先检查是否是王炸
+        val currentIsWangZha = isFourJokers(current)
+        val lastIsWangZha = isFourJokers(last)
+
+        if (currentIsWangZha && !lastIsWangZha) return true  // 王炸最大
+        if (!currentIsWangZha && lastIsWangZha) return false // 对方王炸，压不过
+        if (currentIsWangZha && lastIsWangZha) return false   // 都是王炸，先出为大
+
+        // 都不是王炸，正常比较
         if (current.size != last.size) return current.size > last.size
         return getBombValueWithFengRenPei(current) > getBombValueWithFengRenPei(last)
     }
 
+    /**
+     * 【关键修复】获取炸弹点数（王炸给最大值100）
+     */
     private fun getBombValueWithFengRenPei(cards: List<Card>): Int {
+        // 【新增】检查是否是王炸
+        if (isFourJokers(cards)) {
+            return 100  // 王炸最大，给远大于其他炸弹的值
+        }
+
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         val validNormalCards = normalCards.filter { !it.rank.isJoker() }
 
@@ -749,13 +876,26 @@ class GuandanGame {
         return getEffectiveValue(current[0].rank) > getEffectiveValue(last[0].rank)
     }
 
+    /**
+     * 【修改】炸弹vs同花顺比较（6张及以上炸弹 > 同花顺 > 5张炸弹）
+     */
     private fun compareBombWithStraightFlush(current: List<Card>, last: List<Card>): Boolean {
-        if (current.size != last.size) return current.size > last.size
-        return false
+        // current是炸弹，last是同花顺
+        // 规则：6张及以上炸弹 > 同花顺 > 5张炸弹
+        if (current.size >= 6) return true  // 6张及以上炸弹压同花顺
+        if (current.size == 5) return false  // 5张炸弹 < 同花顺
+        return false  // 4张炸弹 < 同花顺
     }
 
+    /**
+     * 【修改】同花顺vs炸弹比较
+     */
     private fun compareStraightFlushWithBomb(current: List<Card>, last: List<Card>): Boolean {
-        return current.size >= last.size
+        // current是同花顺，last是炸弹
+        // 规则：同花顺 > 5张炸弹，同花顺 < 6张及以上炸弹
+        if (last.size >= 6) return false  // 同花顺 < 6张及以上炸弹
+        if (last.size == 5) return true   // 同花顺 > 5张炸弹
+        return true  // 同花顺 > 4张炸弹
     }
 
     /**
@@ -802,7 +942,8 @@ class GuandanGame {
 
             val lastPlayer = gameRoom.players.find { it.id == lastPlayerId }
 
-            val isTeammate = lastPlayer != null && lastPlayer.team == aiPlayer.team && lastPlayer.id != aiPlayer.id
+            val isTeammate =
+                lastPlayer != null && lastPlayer.team == aiPlayer.team && lastPlayer.id != aiPlayer.id
 
             if (isTeammate && isTeammateBigPlay(lastPlayedCards, lastType)) {
                 passTurn(aiPlayer.id)
@@ -812,10 +953,11 @@ class GuandanGame {
             playedCards = when (lastType) {
                 CardType.SINGLE -> {
                     if (enemyAlmostWin) {
-                        val alternative = findAnyPairWithFengRenPei(cards).takeIf { it.isNotEmpty() }
-                            ?: findAnyTripleWithFengRenPei(cards).takeIf { it.isNotEmpty() }
-                            ?: findAnyBombWithFengRenPei(cards).takeIf { it.isNotEmpty() }
-                            ?: emptyList()
+                        val alternative =
+                            findAnyPairWithFengRenPei(cards).takeIf { it.isNotEmpty() }
+                                ?: findAnyTripleWithFengRenPei(cards).takeIf { it.isNotEmpty() }
+                                ?: findAnyBombWithFengRenPei(cards).takeIf { it.isNotEmpty() }
+                                ?: emptyList()
                         if (alternative.isNotEmpty()) {
                             val altType = getCardTypeWithFengRenPei(alternative)
                             if (altType != null && canBeatLastCards(alternative, altType)) {
@@ -830,11 +972,13 @@ class GuandanGame {
                         findMinSingleToBeatWithFengRenPei(cards, lastPlayedCards[0])
                     }
                 }
+
                 CardType.PAIR -> {
                     if (enemyAlmostWin) {
-                        val alternative = findAnyTripleWithFengRenPei(cards).takeIf { it.isNotEmpty() }
-                            ?: findAnyBombWithFengRenPei(cards).takeIf { it.isNotEmpty() }
-                            ?: emptyList()
+                        val alternative =
+                            findAnyTripleWithFengRenPei(cards).takeIf { it.isNotEmpty() }
+                                ?: findAnyBombWithFengRenPei(cards).takeIf { it.isNotEmpty() }
+                                ?: emptyList()
                         if (alternative.isNotEmpty()) {
                             val altType = getCardTypeWithFengRenPei(alternative)
                             if (altType != null && canBeatLastCards(alternative, altType)) {
@@ -849,6 +993,7 @@ class GuandanGame {
                         findMinPairToBeatWithFengRenPei(cards, lastPlayedCards[0].rank)
                     }
                 }
+
                 CardType.TRIPLE -> findMinTripleToBeatWithFengRenPei(cards, lastPlayedCards[0].rank)
                 CardType.BOMB -> {
                     if (isTeammate) emptyList() else findMinBombToBeatWithFengRenPei(
@@ -858,10 +1003,18 @@ class GuandanGame {
                     )
                 }
 
-                CardType.THREE_WITH_TWO -> findMinThreeWithTwoToBeatWithFengRenPei(cards, lastPlayedCards)
+                CardType.THREE_WITH_TWO -> findMinThreeWithTwoToBeatWithFengRenPei(
+                    cards,
+                    lastPlayedCards
+                )
+
                 CardType.STRAIGHT -> findMinStraightToBeatWithFengRenPei(cards, lastPlayedCards)
                 CardType.PLANK -> findMinPlankToBeatWithFengRenPei(cards, lastPlayedCards)
-                CardType.STEEL_PLATE -> findMinSteelPlateToBeatWithFengRenPei(cards, lastPlayedCards)
+                CardType.STEEL_PLATE -> findMinSteelPlateToBeatWithFengRenPei(
+                    cards,
+                    lastPlayedCards
+                )
+
                 else -> emptyList()
             }
 
@@ -873,19 +1026,47 @@ class GuandanGame {
             playedCards = when {
                 minEnemyCards <= 2 -> {
                     when {
-                        findAnySteelPlateWithFengRenPei(cards).isNotEmpty() -> findAnySteelPlateWithFengRenPei(cards)
-                        findAnyPlankWithFengRenPei(cards).isNotEmpty() -> findAnyPlankWithFengRenPei(cards)
-                        findAnyStraightWithFengRenPei(cards).isNotEmpty() -> findAnyStraightWithFengRenPei(cards)
-                        findAnyThreeWithTwoWithFengRenPei(cards).isNotEmpty() -> findAnyThreeWithTwoWithFengRenPei(cards)
-                        findAnyTripleWithFengRenPei(cards).isNotEmpty() -> findAnyTripleWithFengRenPei(cards)
-                        findAnyPairWithFengRenPei(cards).isNotEmpty() -> findMaxPairWithFengRenPei(cards)
-                        else -> findMaxSingleWithFengRenPei(cards)
+                        findAnySteelPlateWithFengRenPei(cards).isNotEmpty() -> findAnySteelPlateWithFengRenPei(
+                            cards
+                        )
+
+                        findAnyPlankWithFengRenPei(cards).isNotEmpty() -> findAnyPlankWithFengRenPei(
+                            cards
+                        )
+
+                        findAnyStraightWithFengRenPei(cards).isNotEmpty() -> findAnyStraightWithFengRenPei(
+                            cards
+                        )
+
+                        findAnyThreeWithTwoWithFengRenPei(cards).isNotEmpty() -> findAnyThreeWithTwoWithFengRenPei(
+                            cards
+                        )
+
+                        findAnyTripleWithFengRenPei(cards).isNotEmpty() -> findAnyTripleWithFengRenPei(
+                            cards
+                        )
+
+                        findAnyPairWithFengRenPei(cards).isNotEmpty() -> findMaxPairWithFengRenPei(
+                            cards
+                        )
+
+                        else -> findMinSingleWithFengRenPei(cards)
                     }
                 }
-                findAnySteelPlateWithFengRenPei(cards).isNotEmpty() -> findAnySteelPlateWithFengRenPei(cards)
+
+                findAnySteelPlateWithFengRenPei(cards).isNotEmpty() -> findAnySteelPlateWithFengRenPei(
+                    cards
+                )
+
                 findAnyPlankWithFengRenPei(cards).isNotEmpty() -> findAnyPlankWithFengRenPei(cards)
-                findAnyStraightWithFengRenPei(cards).isNotEmpty() -> findAnyStraightWithFengRenPei(cards)
-                findAnyThreeWithTwoWithFengRenPei(cards).isNotEmpty() -> findAnyThreeWithTwoWithFengRenPei(cards)
+                findAnyStraightWithFengRenPei(cards).isNotEmpty() -> findAnyStraightWithFengRenPei(
+                    cards
+                )
+
+                findAnyThreeWithTwoWithFengRenPei(cards).isNotEmpty() -> findAnyThreeWithTwoWithFengRenPei(
+                    cards
+                )
+
                 findAnyTripleWithFengRenPei(cards).isNotEmpty() -> findAnyTripleWithFengRenPei(cards)
                 findAnyPairWithFengRenPei(cards).isNotEmpty() -> findAnyPairWithFengRenPei(cards)
                 else -> findMinSingleWithFengRenPei(cards)
@@ -914,9 +1095,12 @@ class GuandanGame {
     private fun findMinSingleToBeatWithFengRenPei(cards: List<Card>, target: Card): List<Card> {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
 
-        val targetEffectiveValue = if (isFengRenPei(target)) getEffectiveValue(fixedLevelRank) else getEffectiveValue(target.rank)
+        val targetEffectiveValue =
+            if (isFengRenPei(target)) getEffectiveValue(fixedLevelRank) else getEffectiveValue(
+                target.rank
+            )
 
-        // 【关键修改】单张出牌时，王可以参与比较，不要过滤掉
+        // 单张出牌时，王可以参与比较，不要过滤掉
         val minNormal = normalCards.filter { getEffectiveValue(it.rank) > targetEffectiveValue }
             .minWithOrNull(Comparator { c1, c2 ->
                 getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
@@ -936,9 +1120,12 @@ class GuandanGame {
     private fun findMaxSingleToBeatWithFengRenPei(cards: List<Card>, target: Card): List<Card> {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
 
-        val targetEffectiveValue = if (isFengRenPei(target)) getEffectiveValue(fixedLevelRank) else getEffectiveValue(target.rank)
+        val targetEffectiveValue =
+            if (isFengRenPei(target)) getEffectiveValue(fixedLevelRank) else getEffectiveValue(
+                target.rank
+            )
 
-        // 【关键修改】单张出牌时，王可以参与比较，不要过滤掉
+        // 单张出牌时，王可以参与比较，不要过滤掉
         val maxNormal = normalCards.filter { getEffectiveValue(it.rank) > targetEffectiveValue }
             .maxWithOrNull(Comparator { c1, c2 ->
                 getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
@@ -955,7 +1142,10 @@ class GuandanGame {
     /**
      * 【新增】找最小对子压牌（支持逢人配，不能当王）
      */
-    private fun findMinPairToBeatWithFengRenPei(cards: List<Card>, targetRank: CardRank): List<Card> {
+    private fun findMinPairToBeatWithFengRenPei(
+        cards: List<Card>,
+        targetRank: CardRank
+    ): List<Card> {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         val validNormalCards = normalCards.filter { !it.rank.isJoker() }
 
@@ -974,10 +1164,11 @@ class GuandanGame {
 
         // 用1张配+1张普通牌组成对子（不能是王）
         if (fengRenPeiList.isNotEmpty()) {
-            val minCard = validNormalCards.filter { getEffectiveValue(it.rank) > targetEffectiveValue }
-                .minWithOrNull(Comparator { c1, c2 ->
-                    getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
-                })
+            val minCard =
+                validNormalCards.filter { getEffectiveValue(it.rank) > targetEffectiveValue }
+                    .minWithOrNull(Comparator { c1, c2 ->
+                        getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
+                    })
             if (minCard != null) {
                 return listOf(fengRenPeiList[0], minCard)
             }
@@ -989,7 +1180,10 @@ class GuandanGame {
     /**
      * 【新增】找最大对子压牌（支持逢人配，不能当王）
      */
-    private fun findMaxPairToBeatWithFengRenPei(cards: List<Card>, targetRank: CardRank): List<Card> {
+    private fun findMaxPairToBeatWithFengRenPei(
+        cards: List<Card>,
+        targetRank: CardRank
+    ): List<Card> {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         val validNormalCards = normalCards.filter { !it.rank.isJoker() }
 
@@ -1008,10 +1202,11 @@ class GuandanGame {
 
         // 用配组成对子
         if (fengRenPeiList.isNotEmpty()) {
-            val maxCard = validNormalCards.filter { getEffectiveValue(it.rank) > targetEffectiveValue }
-                .maxWithOrNull(Comparator { c1, c2 ->
-                    getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
-                })
+            val maxCard =
+                validNormalCards.filter { getEffectiveValue(it.rank) > targetEffectiveValue }
+                    .maxWithOrNull(Comparator { c1, c2 ->
+                        getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
+                    })
             if (maxCard != null) {
                 return listOf(fengRenPeiList[0], maxCard)
             }
@@ -1023,7 +1218,10 @@ class GuandanGame {
     /**
      * 【新增】找最小三张压牌（支持逢人配，不能当王）
      */
-    private fun findMinTripleToBeatWithFengRenPei(cards: List<Card>, targetRank: CardRank): List<Card> {
+    private fun findMinTripleToBeatWithFengRenPei(
+        cards: List<Card>,
+        targetRank: CardRank
+    ): List<Card> {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         val validNormalCards = normalCards.filter { !it.rank.isJoker() }
 
@@ -1043,10 +1241,11 @@ class GuandanGame {
 
         // 用配凑三张：2配+1张 或 1配+2张相同（都不能是王）
         if (fengRenPeiCount >= 2) {
-            val minCard = validNormalCards.filter { getEffectiveValue(it.rank) > targetEffectiveValue }
-                .minWithOrNull(Comparator { c1, c2 ->
-                    getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
-                })
+            val minCard =
+                validNormalCards.filter { getEffectiveValue(it.rank) > targetEffectiveValue }
+                    .minWithOrNull(Comparator { c1, c2 ->
+                        getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
+                    })
             if (minCard != null) {
                 return listOf(fengRenPeiList[0], fengRenPeiList[1], minCard)
             }
@@ -1066,7 +1265,7 @@ class GuandanGame {
     }
 
     /**
-     * 【修改】找最小炸弹压牌（支持逢人配，不能当王）
+     * 【修改】找最小炸弹压牌（支持逢人配，不能当王，识别王炸）
      */
     private fun findMinBombToBeatWithFengRenPei(
         cards: List<Card>,
@@ -1076,9 +1275,9 @@ class GuandanGame {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         val fengRenPeiCount = fengRenPeiList.size
 
-        // 【关键】如果目标炸弹是王炸（4张王），配不能压，因为配不能当王
-        if (targetRank.isJoker()) {
-            // 只能用真王炸压，不能用配
+        // 【关键】如果目标炸弹是王炸（4张王），只能用真王炸压
+        if (isFourJokers(List(targetCount) { Card(CardSuit.JOKER, targetRank) })) {
+            // 目标有王，检查自己是否有4张王
             val myJokers = normalCards.filter { it.rank.isJoker() }
             if (myJokers.size >= 4) {
                 return myJokers.take(4)
@@ -1102,7 +1301,7 @@ class GuandanGame {
         }
 
         // 找数量更多的炸弹（可以用配，但不能当王）
-        for (count in (targetCount + 1)..8) {
+        for (count in (targetCount + 1)..10) {  // 【修改】支持到10张
             // 普通牌数量+配数量 >= count，且普通牌不是王
             val possibleRanks = rankMap.filter { entry ->
                 entry.value.size + fengRenPeiCount >= count
@@ -1123,16 +1322,23 @@ class GuandanGame {
     /**
      * 【修改】找最小三带二压牌（支持逢人配，不能当王）
      */
-    private fun findMinThreeWithTwoToBeatWithFengRenPei(cards: List<Card>, lastCards: List<Card>): List<Card> {
+    private fun findMinThreeWithTwoToBeatWithFengRenPei(
+        cards: List<Card>,
+        lastCards: List<Card>
+    ): List<Card> {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         val fengRenPeiCount = fengRenPeiList.size
 
         // 过滤出非王牌
         val validNormalCards = normalCards.filter { !it.rank.isJoker() }
 
-        val lastThreeRank = lastCards.groupBy { it.rank }.filter { it.value.size == 3 }.keys.firstOrNull()
-            ?: lastCards[0].rank
-        val lastEffectiveValue = if (isFengRenPei(lastCards[0])) getEffectiveValue(fixedLevelRank) else getEffectiveValue(lastThreeRank)
+        val lastThreeRank =
+            lastCards.groupBy { it.rank }.filter { it.value.size == 3 }.keys.firstOrNull()
+                ?: lastCards[0].rank
+        val lastEffectiveValue =
+            if (isFengRenPei(lastCards[0])) getEffectiveValue(fixedLevelRank) else getEffectiveValue(
+                lastThreeRank
+            )
 
         val rankMap = validNormalCards.groupBy { it.rank }
 
@@ -1149,10 +1355,11 @@ class GuandanGame {
             threeCards = rankMap[validTriples.first()]!!.take(3)
         } else if (fengRenPeiCount >= 2) {
             // 2配+1张（不能是王）
-            val minCard = validNormalCards.filter { getEffectiveValue(it.rank) > lastEffectiveValue }
-                .minWithOrNull(Comparator { c1, c2 ->
-                    getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
-                })
+            val minCard =
+                validNormalCards.filter { getEffectiveValue(it.rank) > lastEffectiveValue }
+                    .minWithOrNull(Comparator { c1, c2 ->
+                        getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
+                    })
             if (minCard != null) {
                 threeCards = listOf(fengRenPeiList[0], fengRenPeiList[1], minCard)
                 usedFengRenPeiForThree = 2
@@ -1172,7 +1379,8 @@ class GuandanGame {
         if (threeCards == null) return emptyList()
 
         // 找对子部分（不能用三张的点数，不能是王）
-        val threeRank = threeCards.filter { !isFengRenPei(it) }.map { it.rank }.distinct().firstOrNull()
+        val threeRank =
+            threeCards.filter { !isFengRenPei(it) }.map { it.rank }.distinct().firstOrNull()
         val remainingFengRenPei = fengRenPeiCount - usedFengRenPeiForThree
         val remainingNormal = validNormalCards.filter { it.rank != threeRank }
 
@@ -1187,8 +1395,12 @@ class GuandanGame {
             }
             // 2配（当对子）
             remainingFengRenPei >= 2 -> {
-                listOf(fengRenPeiList[usedFengRenPeiForThree], fengRenPeiList[usedFengRenPeiForThree + 1])
+                listOf(
+                    fengRenPeiList[usedFengRenPeiForThree],
+                    fengRenPeiList[usedFengRenPeiForThree + 1]
+                )
             }
+
             else -> return emptyList()
         }
 
@@ -1198,7 +1410,10 @@ class GuandanGame {
     /**
      * 【修改】找最小顺子压牌（支持逢人配，不能当2或王）
      */
-    private fun findMinStraightToBeatWithFengRenPei(cards: List<Card>, lastCards: List<Card>): List<Card> {
+    private fun findMinStraightToBeatWithFengRenPei(
+        cards: List<Card>,
+        lastCards: List<Card>
+    ): List<Card> {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         val fengRenPeiCount = fengRenPeiList.size
 
@@ -1215,7 +1430,7 @@ class GuandanGame {
 
         for (start in 3..(lastMaxEffective - size + 1)) {
             val end = start + size - 1
-            if (end > 14) continue // A是14
+            if (end > 14) continue // 不能超过A
 
             val neededRanks = (start..end).toList()
             val haveRanks = uniqueRanks.filter { it in neededRanks }
@@ -1252,7 +1467,10 @@ class GuandanGame {
     /**
      * 【新增】找最小木板压牌（支持逢人配）- 简化版
      */
-    private fun findMinPlankToBeatWithFengRenPei(cards: List<Card>, lastCards: List<Card>): List<Card> {
+    private fun findMinPlankToBeatWithFengRenPei(
+        cards: List<Card>,
+        lastCards: List<Card>
+    ): List<Card> {
         // 简化处理：有配时不找木板，避免复杂性
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         if (fengRenPeiList.isNotEmpty()) return emptyList()
@@ -1264,7 +1482,8 @@ class GuandanGame {
      */
     private fun findMinPlankToBeat(cards: List<Card>, lastCards: List<Card>): List<Card> {
         val lastMaxEffective = lastCards.maxOf { getEffectiveValue(it.rank) }
-        val rankMap = cards.filter { it.rank != CardRank.TWO && !it.rank.isJoker() }.groupBy { it.rank }
+        val rankMap =
+            cards.filter { it.rank != CardRank.TWO && !it.rank.isJoker() }.groupBy { it.rank }
 
         val validRanks = rankMap.filter {
             it.value.size >= 2 && getEffectiveValue(it.key) > lastMaxEffective - 2
@@ -1287,7 +1506,10 @@ class GuandanGame {
     /**
      * 【新增】找最小钢板压牌（支持逢人配）- 简化版
      */
-    private fun findMinSteelPlateToBeatWithFengRenPei(cards: List<Card>, lastCards: List<Card>): List<Card> {
+    private fun findMinSteelPlateToBeatWithFengRenPei(
+        cards: List<Card>,
+        lastCards: List<Card>
+    ): List<Card> {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
         if (fengRenPeiList.isNotEmpty()) return emptyList() // 简化：有配时不处理钢板
         return findMinSteelPlateToBeat(cards, lastCards)
@@ -1298,7 +1520,8 @@ class GuandanGame {
      */
     private fun findMinSteelPlateToBeat(cards: List<Card>, lastCards: List<Card>): List<Card> {
         val lastMaxEffective = lastCards.groupBy { it.rank }.keys.maxOf { getEffectiveValue(it) }
-        val rankMap = cards.filter { it.rank != CardRank.TWO && !it.rank.isJoker() }.groupBy { it.rank }
+        val rankMap =
+            cards.filter { it.rank != CardRank.TWO && !it.rank.isJoker() }.groupBy { it.rank }
 
         val validRanks = rankMap.filter {
             it.value.size >= 3 && getEffectiveValue(it.key) > lastMaxEffective - 1
@@ -1330,8 +1553,10 @@ class GuandanGame {
      * 【保留】找任意钢板（无逢人配）
      */
     private fun findAnySteelPlate(cards: List<Card>): List<Card> {
-        val rankMap = cards.filter { it.rank != CardRank.TWO && !it.rank.isJoker() }.groupBy { it.rank }
-        val tripleRanks = rankMap.filter { it.value.size >= 3 }.keys.sortedBy { getEffectiveValue(it) }
+        val rankMap =
+            cards.filter { it.rank != CardRank.TWO && !it.rank.isJoker() }.groupBy { it.rank }
+        val tripleRanks =
+            rankMap.filter { it.value.size >= 3 }.keys.sortedBy { getEffectiveValue(it) }
 
         if (tripleRanks.size < 2) return emptyList()
 
@@ -1357,8 +1582,10 @@ class GuandanGame {
      * 【保留】找任意木板（无逢人配）
      */
     private fun findAnyPlank(cards: List<Card>): List<Card> {
-        val rankMap = cards.filter { it.rank != CardRank.TWO && !it.rank.isJoker() }.groupBy { it.rank }
-        val pairRanks = rankMap.filter { it.value.size >= 2 }.keys.sortedBy { getEffectiveValue(it) }
+        val rankMap =
+            cards.filter { it.rank != CardRank.TWO && !it.rank.isJoker() }.groupBy { it.rank }
+        val pairRanks =
+            rankMap.filter { it.value.size >= 2 }.keys.sortedBy { getEffectiveValue(it) }
 
         if (pairRanks.size < 3) return emptyList()
 
@@ -1441,7 +1668,8 @@ class GuandanGame {
         var usedFengRenPeiForThree = 0
 
         // 普通三张
-        val tripleRank = rankMap.filter { it.value.size >= 3 }.keys.minByOrNull { getEffectiveValue(it) }
+        val tripleRank =
+            rankMap.filter { it.value.size >= 3 }.keys.minByOrNull { getEffectiveValue(it) }
         if (tripleRank != null) {
             threeCards = rankMap[tripleRank]!!.take(3)
         } else if (fengRenPeiCount >= 2) {
@@ -1455,7 +1683,8 @@ class GuandanGame {
             }
         } else if (fengRenPeiCount >= 1) {
             // 1配+2张相同（不能是王）
-            val pairRank = rankMap.filter { it.value.size >= 2 }.keys.minByOrNull { getEffectiveValue(it) }
+            val pairRank =
+                rankMap.filter { it.value.size >= 2 }.keys.minByOrNull { getEffectiveValue(it) }
             if (pairRank != null) {
                 threeCards = rankMap[pairRank]!!.take(2) + fengRenPeiList[0]
                 usedFengRenPeiForThree = 1
@@ -1465,7 +1694,8 @@ class GuandanGame {
         if (threeCards == null) return emptyList()
 
         // 找对子部分（不能用三张的点数，不能是王）
-        val threeRank = threeCards.filter { !isFengRenPei(it) }.map { it.rank }.distinct().firstOrNull()
+        val threeRank =
+            threeCards.filter { !isFengRenPei(it) }.map { it.rank }.distinct().firstOrNull()
         val remainingFengRenPei = fengRenPeiCount - usedFengRenPeiForThree
         val remainingNormal = validNormalCards.filter { it.rank != threeRank }
 
@@ -1480,8 +1710,12 @@ class GuandanGame {
             }
             // 2配（当对子）
             remainingFengRenPei >= 2 -> {
-                listOf(fengRenPeiList[usedFengRenPeiForThree], fengRenPeiList[usedFengRenPeiForThree + 1])
+                listOf(
+                    fengRenPeiList[usedFengRenPeiForThree],
+                    fengRenPeiList[usedFengRenPeiForThree + 1]
+                )
             }
+
             else -> return emptyList()
         }
 
@@ -1500,7 +1734,8 @@ class GuandanGame {
         val rankMap = validNormalCards.groupBy { it.rank }
 
         // 普通三张
-        val triple = rankMap.filter { it.value.size >= 3 }.values.minByOrNull { getEffectiveValue(it[0].rank) }
+        val triple =
+            rankMap.filter { it.value.size >= 3 }.values.minByOrNull { getEffectiveValue(it[0].rank) }
         if (triple != null) return triple.take(3)
 
         // 2配+1张（不能是王）
@@ -1515,7 +1750,8 @@ class GuandanGame {
 
         // 1配+2张相同（不能是王）
         if (fengRenPeiCount >= 1) {
-            val pair = rankMap.filter { it.value.size >= 2 }.values.minByOrNull { getEffectiveValue(it[0].rank) }
+            val pair =
+                rankMap.filter { it.value.size >= 2 }.values.minByOrNull { getEffectiveValue(it[0].rank) }
             if (pair != null) {
                 return pair.take(2) + fengRenPeiList[0]
             }
@@ -1535,7 +1771,8 @@ class GuandanGame {
 
         // 普通对子
         val rankMap = validNormalCards.groupBy { it.rank }
-        val pair = rankMap.filter { it.value.size >= 2 }.values.minByOrNull { getEffectiveValue(it[0].rank) }
+        val pair =
+            rankMap.filter { it.value.size >= 2 }.values.minByOrNull { getEffectiveValue(it[0].rank) }
         if (pair != null) return pair.take(2)
 
         // 1配+1张（不能是王）
@@ -1559,7 +1796,8 @@ class GuandanGame {
         val validNormalCards = normalCards.filter { !it.rank.isJoker() }
 
         val rankMap = validNormalCards.groupBy { it.rank }
-        val pair = rankMap.filter { it.value.size >= 2 }.values.maxByOrNull { getEffectiveValue(it[0].rank) }
+        val pair =
+            rankMap.filter { it.value.size >= 2 }.values.maxByOrNull { getEffectiveValue(it[0].rank) }
         if (pair != null) return pair.take(2)
 
         if (fengRenPeiList.isNotEmpty() && validNormalCards.isNotEmpty()) {
@@ -1575,7 +1813,7 @@ class GuandanGame {
     }
 
     /**
-     * 【修改】找任意炸弹（支持逢人配，不能当王）
+     * 【修改】找任意炸弹（支持逢人配，不能当王，王炸最大）
      */
     private fun findAnyBombWithFengRenPei(cards: List<Card>): List<Card> {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
@@ -1585,10 +1823,17 @@ class GuandanGame {
         val validNormalCards = normalCards.filter { !it.rank.isJoker() }
         val rankMap = validNormalCards.groupBy { it.rank }
 
-        // 优先找更大的炸弹（8张>6张>5张>4张）
-        for (count in 8 downTo 4) {
+        // 【新增】先检查是否有真王炸（4张王，不能用配）
+        val jokers = normalCards.filter { it.rank.isJoker() }
+        if (jokers.size >= 4) {
+            return jokers.take(4)
+        }
+
+        // 优先找更大的炸弹（10张>8张>6张>5张>4张）
+        for (count in 10 downTo 4) {
             // 普通炸弹
-            val normalBomb = rankMap.filter { it.value.size >= count }.values.minByOrNull { getEffectiveValue(it[0].rank) }
+            val normalBomb =
+                rankMap.filter { it.value.size >= count }.values.minByOrNull { getEffectiveValue(it[0].rank) }
             if (normalBomb != null) return normalBomb.take(count)
 
             // 用配凑炸弹（不能当王）
@@ -1604,12 +1849,6 @@ class GuandanGame {
             }
         }
 
-        // 【新增】检查是否有真王炸（4张王，不能用配）
-        val jokers = normalCards.filter { it.rank.isJoker() }
-        if (jokers.size >= 4) {
-            return jokers.take(4)
-        }
-
         return emptyList()
     }
 
@@ -1619,7 +1858,7 @@ class GuandanGame {
     private fun findMaxSingleWithFengRenPei(cards: List<Card>): List<Card> {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
 
-        // 【修改】保留王
+        // 保留王
         val maxNormal = normalCards.maxWithOrNull(Comparator { c1, c2 ->
             getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
         })
@@ -1635,16 +1874,10 @@ class GuandanGame {
     /**
      * 【修改】找最小单张（支持逢人配和王）- 用于首轮出牌
      */
-    /**
-     * 【修改】找最小单张（支持逢人配和王）- 用于首轮出牌
-     */
-    /**
-     * 【修改】找最小单张（支持逢人配和王）- 用于首轮出牌
-     */
     private fun findMinSingleWithFengRenPei(cards: List<Card>): List<Card> {
         val (fengRenPeiList, normalCards) = separateFengRenPei(cards)
 
-        // 【修改】保留王
+        // 保留王
         val minNormal = normalCards.minWithOrNull(Comparator { c1, c2 ->
             getEffectiveValue(c1.rank) - getEffectiveValue(c2.rank)
         })
@@ -1688,19 +1921,28 @@ class GuandanGame {
         val currentPlayer = gameRoom.players.find { it.isCurrentTurn }
 
         if (currentPlayer?.id != playerId) {
-            android.util.Log.w("GuandanGame", "passTurn: 玩家$playerId 不是当前玩家 ${currentPlayer?.id}，但继续执行")
+            android.util.Log.w(
+                "GuandanGame",
+                "passTurn: 玩家$playerId 不是当前玩家 ${currentPlayer?.id}，但继续执行"
+            )
             val requestingPlayer = gameRoom.players.find { it.id == playerId }
             if (requestingPlayer == null) {
                 android.util.Log.e("GuandanGame", "passTurn: 找不到玩家$playerId")
                 return
             }
             if (!requestingPlayer.isCurrentTurn) {
-                android.util.Log.d("GuandanGame", "passTurn: 玩家${requestingPlayer.name}标记不是当前回合，但强制过牌")
+                android.util.Log.d(
+                    "GuandanGame",
+                    "passTurn: 玩家${requestingPlayer.name}标记不是当前回合，但强制过牌"
+                )
             }
         }
 
         passCount++
-        android.util.Log.d("GuandanGame", "玩家${currentPlayer?.name ?: playerId} 过牌，passCount=$passCount")
+        android.util.Log.d(
+            "GuandanGame",
+            "玩家${currentPlayer?.name ?: playerId} 过牌，passCount=$passCount"
+        )
 
         if (passCount >= gameRoom.players.size - 1) {
             lastPlayedCards = emptyList()
@@ -1790,7 +2032,8 @@ class GuandanGame {
         if (touYouPlayer != null) {
             val winnerTeam = touYouPlayer.team
 
-            val winnerTeammate = sortedPlayers.find { it.team == winnerTeam && it.id != touYouPlayer.id }
+            val winnerTeammate =
+                sortedPlayers.find { it.team == winnerTeam && it.id != touYouPlayer.id }
             val teammateRank = winnerTeammate?.let { player ->
                 sortedPlayers.indexOfFirst { it.id == player.id } + 1
             } ?: 4
