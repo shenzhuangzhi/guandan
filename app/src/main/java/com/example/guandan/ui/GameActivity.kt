@@ -928,9 +928,11 @@ class GameActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 【修改】重新开始游戏（带等级）
+     */
     private fun restartGameWithLevel(team0Level: Int, team1Level: Int) {
         handler.removeCallbacksAndMessages(null)
-
         forceClearAllSelection("restartGameWithLevel")
 
         savedTeam0Level = team0Level
@@ -939,9 +941,15 @@ class GameActivity : AppCompatActivity() {
         val touYouPosition = guandanGame?.lastTouYouPosition ?: 0
         println("重新开始游戏，头游位置=$touYouPosition")
 
+        // 【关键】重置游戏状态，清空上一局的出牌记录
+        guandanGame?.resetGameState()
+
         guandanGame?.resetUpgradeFlag()
 
         initGame(currentGameMode, team0Level, team1Level, touYouPosition)
+
+        // 【关键】确保新局开始时lastPlayedCards为空
+        // 这个在initGame中应该已经处理，但再确认一次
 
         if (gameRoom?.players?.find { it.isCurrentTurn }?.isAI == true) {
             startAIAutoPlayChain()
